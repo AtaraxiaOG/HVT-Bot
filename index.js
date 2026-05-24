@@ -1,12 +1,52 @@
 require('dotenv').config();
+
+const {
+  Client,
+  GatewayIntentBits,
+  SlashCommandBuilder,
+  Routes,
+  REST
+} = require('discord.js');
+
+const fs = require('fs');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
+});
+
+const linkedUsersFile = './linkedUsers.json';
+
+function loadLinks() {
+  if (!fs.existsSync(linkedUsersFile)) {
+    fs.writeFileSync(linkedUsersFile, '{}');
+  }
+
+  return JSON.parse(fs.readFileSync(linkedUsersFile));
+}
+
+function saveLinks(data) {
+  fs.writeFileSync(linkedUsersFile, JSON.stringify(data, null, 2));
+}
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('link')
+    .setDescription('Link your Palworld account')
+    .addStringOption(option =>
+      option
+        .setName('steamid')
+        .setDescription('Your SteamID64')
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName('daily')
-    .setDescription('Claim your daily kit')
-]
-.map(command => command.toJSON());
+    .setDescription('Claim your daily reward')
+].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
@@ -16,13 +56,13 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
     await rest.put(
       Routes.applicationGuildCommands(
-        '1507905735013568532',
+        process.env.CLIENT_ID,
         process.env.GUILD_ID
       ),
       { body: commands }
     );
 
-    console.log('Commands registered.');
+    console.log('Slash commands registered.');
   } catch (error) {
     console.error(error);
   }
@@ -30,14 +70,6 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
-});
-
-client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-
-  console.log(`[Discord Chat] ${message.author.username}: ${message.content}`);
-
-  // Future Palworld relay goes here
 });
 
 client.on('interactionCreate', async interaction => {
@@ -53,7 +85,7 @@ client.on('interactionCreate', async interaction => {
     saveLinks(links);
 
     await interaction.reply({
-      content: `Linked SteamID ${steamid} successfully.`,
+      content: `Successfully linked SteamID: ${steamid}`,
       ephemeral: true
     });
   }
@@ -71,13 +103,11 @@ client.on('interactionCreate', async interaction => {
     }
 
     await interaction.reply({
-      content: 'Daily kit granted in game.',
+      content: 'Daily reward claimed successfully.',
       ephemeral: true
     });
 
-    console.log(`Give daily kit to ${steamid}`);
-
-    // RCON reward command goes here
+    console.log(`Daily reward granted to ${steamid}`);
   }
 });
 
