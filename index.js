@@ -17,8 +17,14 @@ let rcon;
 // =========================
 // CONNECT TO PALWORLD RCON
 // =========================
-(async () => {
+async function connectRcon() {
   try {
+
+    console.log('Attempting RCON connection...');
+
+    console.log('RCON IP:', process.env.PALWORLD_RCON_IP);
+    console.log('RCON PORT:', process.env.PALWORLD_RCON_PORT);
+
     rcon = await Rcon.connect({
       host: process.env.PALWORLD_RCON_IP,
       port: parseInt(process.env.PALWORLD_RCON_PORT),
@@ -26,10 +32,16 @@ let rcon;
     });
 
     console.log('Connected to Palworld RCON');
+
   } catch (err) {
+
     console.error('RCON Connection Failed:', err);
+
+    rcon = null;
   }
-})();
+}
+
+connectRcon();
 
 // =========================
 // CREATE DISCORD CLIENT
@@ -48,6 +60,7 @@ const client = new Client({
 const linkedUsersFile = './linkedUsers.json';
 
 function loadLinks() {
+
   if (!fs.existsSync(linkedUsersFile)) {
     fs.writeFileSync(linkedUsersFile, '{}');
   }
@@ -56,13 +69,18 @@ function loadLinks() {
 }
 
 function saveLinks(data) {
-  fs.writeFileSync(linkedUsersFile, JSON.stringify(data, null, 2));
+
+  fs.writeFileSync(
+    linkedUsersFile,
+    JSON.stringify(data, null, 2)
+  );
 }
 
 // =========================
 // SLASH COMMANDS
 // =========================
 const commands = [
+
   new SlashCommandBuilder()
     .setName('link')
     .setDescription('Link your Palworld account')
@@ -82,10 +100,13 @@ const commands = [
 // =========================
 // REGISTER SLASH COMMANDS
 // =========================
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+const rest = new REST({ version: '10' })
+  .setToken(process.env.DISCORD_TOKEN);
 
 (async () => {
+
   try {
+
     console.log('Registering slash commands...');
 
     await rest.put(
@@ -97,15 +118,19 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     );
 
     console.log('Slash commands registered.');
+
   } catch (error) {
+
     console.error(error);
   }
+
 })();
 
 // =========================
 // BOT READY
 // =========================
 client.once('ready', () => {
+
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -113,13 +138,19 @@ client.once('ready', () => {
 // DISCORD → PALWORLD CHAT
 // =========================
 client.on('messageCreate', async message => {
+
   if (message.author.bot) return;
 
   if (message.channel.id !== process.env.CHANNEL_ID) return;
 
-  if (!rcon) return;
+  if (!rcon) {
+
+    console.log('RCON is not connected.');
+    return;
+  }
 
   try {
+
     await rcon.send(
       `Broadcast [Discord] ${message.author.username}: ${message.content}`
     );
@@ -129,7 +160,13 @@ client.on('messageCreate', async message => {
     );
 
   } catch (err) {
-    console.error('Failed to relay message to Palworld:', err);
+
+    console.error(
+      'Failed to relay message to Palworld:',
+      err
+    );
+
+    rcon = null;
   }
 });
 
@@ -137,6 +174,7 @@ client.on('messageCreate', async message => {
 // SLASH COMMAND HANDLER
 // =========================
 client.on('interactionCreate', async interaction => {
+
   if (!interaction.isChatInputCommand()) return;
 
   // =========================
@@ -144,7 +182,8 @@ client.on('interactionCreate', async interaction => {
   // =========================
   if (interaction.commandName === 'link') {
 
-    const steamid = interaction.options.getString('steamid');
+    const steamid =
+      interaction.options.getString('steamid');
 
     const links = loadLinks();
 
@@ -153,7 +192,8 @@ client.on('interactionCreate', async interaction => {
     saveLinks(links);
 
     await interaction.reply({
-      content: `Successfully linked SteamID: ${steamid}`,
+      content:
+        `Successfully linked SteamID: ${steamid}`,
       ephemeral: true
     });
   }
@@ -168,38 +208,57 @@ client.on('interactionCreate', async interaction => {
     const steamid = links[interaction.user.id];
 
     if (!steamid) {
+
       return interaction.reply({
-        content: 'You must link your account first using /link',
+        content:
+          'You must link your account first using /link',
         ephemeral: true
       });
     }
 
     try {
 
-      // =========================
-      // GIVE REWARDS IN GAME
-      // =========================
+      if (!rcon) {
 
-      if (rcon) {
-
-        // Example rewards
-        await rcon.send(`GiveItem ${steamid} PalSphere 50`);
-        await rcon.send(`GiveItem ${steamid} Money 10000`);
-
-        console.log(`Daily rewards granted to ${steamid}`);
+        return interaction.reply({
+          content:
+            'Palworld server connection unavailable.',
+          ephemeral: true
+        });
       }
 
+      // =========================
+      // GIVE DAILY REWARDS
+      // =========================
+
+      await rcon.send(
+        `GiveItem ${steamid} PalSphere 50`
+      );
+
+      await rcon.send(
+        `GiveItem ${steamid} Money 10000`
+      );
+
+      console.log(
+        `Daily rewards granted to ${steamid}`
+      );
+
       await interaction.reply({
-        content: 'Daily reward claimed successfully.',
+        content:
+          'Daily reward claimed successfully.',
         ephemeral: true
       });
 
     } catch (err) {
 
-      console.error('Failed to give daily reward:', err);
+      console.error(
+        'Failed to give daily reward:',
+        err
+      );
 
       await interaction.reply({
-        content: 'Failed to claim reward.',
+        content:
+          'Failed to claim reward.',
         ephemeral: true
       });
     }
