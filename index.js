@@ -129,7 +129,7 @@ const rest = new REST({ version: '10' })
 // =========================
 // BOT READY
 // =========================
-client.once('ready', () => {
+client.once('clientReady', () => {
 
   console.log(`Logged in as ${client.user.tag}`);
 });
