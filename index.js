@@ -253,11 +253,11 @@ client.on('interactionCreate', async interaction => {
       // =========================
 
       await sendRconCommand(
-        `GiveItem ${steamid} PalSphere 50`
+        `Give ${steamid} PalSphere 50`
       );
 
       await sendRconCommand(
-        `GiveItem ${steamid} Money 10000`
+        `Give ${steamid} Money 10000`
       );
 
       console.log(
