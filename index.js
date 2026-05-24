@@ -12,18 +12,19 @@ const {
 
 const fs = require('fs');
 
+// =========================
+// RCON VARIABLES
+// =========================
 let rcon;
 
 // =========================
 // CONNECT TO PALWORLD RCON
 // =========================
 async function connectRcon() {
+
   try {
 
     console.log('Attempting RCON connection...');
-
-    console.log('RCON IP:', process.env.PALWORLD_RCON_IP);
-    console.log('RCON PORT:', process.env.PALWORLD_RCON_PORT);
 
     rcon = await Rcon.connect({
       host: process.env.PALWORLD_RCON_IP,
@@ -33,15 +34,53 @@ async function connectRcon() {
 
     console.log('Connected to Palworld RCON');
 
+    return true;
+
   } catch (err) {
 
     console.error('RCON Connection Failed:', err);
 
     rcon = null;
+
+    return false;
   }
 }
 
+// Initial RCON connection
 connectRcon();
+
+// =========================
+// SAFE RCON COMMAND FUNCTION
+// =========================
+async function sendRconCommand(command) {
+
+  try {
+
+    // reconnect if disconnected
+    if (!rcon || !rcon.authenticated) {
+
+      console.log('RCON disconnected. Reconnecting...');
+
+      const connected = await connectRcon();
+
+      if (!connected) {
+        return false;
+      }
+    }
+
+    await rcon.send(command);
+
+    return true;
+
+  } catch (err) {
+
+    console.error('RCON command failed:', err);
+
+    rcon = null;
+
+    return false;
+  }
+}
 
 // =========================
 // CREATE DISCORD CLIENT
@@ -143,30 +182,21 @@ client.on('messageCreate', async message => {
 
   if (message.channel.id !== process.env.CHANNEL_ID) return;
 
-  if (!rcon) {
+  const success = await sendRconCommand(
+    `broadcast [Discord] ${message.author.username}: ${message.content}`
+  );
 
-    console.log('RCON is not connected.');
-    return;
-  }
-
-  try {
-
-    await rcon.send(
-      `Broadcast [Discord] ${message.author.username}: ${message.content}`
-    );
+  if (success) {
 
     console.log(
       `[Discord Relay] ${message.author.username}: ${message.content}`
     );
 
-  } catch (err) {
+  } else {
 
-    console.error(
-      'Failed to relay message to Palworld:',
-      err
+    console.log(
+      'Failed to send Discord message to Palworld.'
     );
-
-    rcon = null;
   }
 });
 
@@ -218,24 +248,15 @@ client.on('interactionCreate', async interaction => {
 
     try {
 
-      if (!rcon) {
-
-        return interaction.reply({
-          content:
-            'Palworld server connection unavailable.',
-          ephemeral: true
-        });
-      }
-
       // =========================
       // GIVE DAILY REWARDS
       // =========================
 
-      await rcon.send(
+      await sendRconCommand(
         `GiveItem ${steamid} PalSphere 50`
       );
 
-      await rcon.send(
+      await sendRconCommand(
         `GiveItem ${steamid} Money 10000`
       );
 
