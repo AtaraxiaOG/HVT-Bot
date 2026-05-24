@@ -1,5 +1,7 @@
 require('dotenv').config();
 
+const { Rcon } = require('rcon-client');
+
 const {
   Client,
   GatewayIntentBits,
@@ -10,6 +12,28 @@ const {
 
 const fs = require('fs');
 
+let rcon;
+
+// =========================
+// CONNECT TO PALWORLD RCON
+// =========================
+(async () => {
+  try {
+    rcon = await Rcon.connect({
+      host: process.env.PALWORLD_RCON_IP,
+      port: parseInt(process.env.PALWORLD_RCON_PORT),
+      password: process.env.PALWORLD_RCON_PASSWORD
+    });
+
+    console.log('Connected to Palworld RCON');
+  } catch (err) {
+    console.error('RCON Connection Failed:', err);
+  }
+})();
+
+// =========================
+// CREATE DISCORD CLIENT
+// =========================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -18,6 +42,9 @@ const client = new Client({
   ]
 });
 
+// =========================
+// LINKED USERS FILE
+// =========================
 const linkedUsersFile = './linkedUsers.json';
 
 function loadLinks() {
@@ -32,6 +59,9 @@ function saveLinks(data) {
   fs.writeFileSync(linkedUsersFile, JSON.stringify(data, null, 2));
 }
 
+// =========================
+// SLASH COMMANDS
+// =========================
 const commands = [
   new SlashCommandBuilder()
     .setName('link')
@@ -46,8 +76,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('daily')
     .setDescription('Claim your daily reward')
+
 ].map(command => command.toJSON());
 
+// =========================
+// REGISTER SLASH COMMANDS
+// =========================
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 (async () => {
@@ -68,14 +102,48 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
+// =========================
+// BOT READY
+// =========================
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
+// =========================
+// DISCORD → PALWORLD CHAT
+// =========================
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+
+  if (message.channel.id !== process.env.CHANNEL_ID) return;
+
+  if (!rcon) return;
+
+  try {
+    await rcon.send(
+      `Broadcast [Discord] ${message.author.username}: ${message.content}`
+    );
+
+    console.log(
+      `[Discord Relay] ${message.author.username}: ${message.content}`
+    );
+
+  } catch (err) {
+    console.error('Failed to relay message to Palworld:', err);
+  }
+});
+
+// =========================
+// SLASH COMMAND HANDLER
+// =========================
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
+  // =========================
+  // /LINK COMMAND
+  // =========================
   if (interaction.commandName === 'link') {
+
     const steamid = interaction.options.getString('steamid');
 
     const links = loadLinks();
@@ -90,7 +158,11 @@ client.on('interactionCreate', async interaction => {
     });
   }
 
+  // =========================
+  // /DAILY COMMAND
+  // =========================
   if (interaction.commandName === 'daily') {
+
     const links = loadLinks();
 
     const steamid = links[interaction.user.id];
@@ -102,13 +174,39 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    await interaction.reply({
-      content: 'Daily reward claimed successfully.',
-      ephemeral: true
-    });
+    try {
 
-    console.log(`Daily reward granted to ${steamid}`);
+      // =========================
+      // GIVE REWARDS IN GAME
+      // =========================
+
+      if (rcon) {
+
+        // Example rewards
+        await rcon.send(`GiveItem ${steamid} PalSphere 50`);
+        await rcon.send(`GiveItem ${steamid} Money 10000`);
+
+        console.log(`Daily rewards granted to ${steamid}`);
+      }
+
+      await interaction.reply({
+        content: 'Daily reward claimed successfully.',
+        ephemeral: true
+      });
+
+    } catch (err) {
+
+      console.error('Failed to give daily reward:', err);
+
+      await interaction.reply({
+        content: 'Failed to claim reward.',
+        ephemeral: true
+      });
+    }
   }
 });
 
+// =========================
+// LOGIN BOT
+// =========================
 client.login(process.env.DISCORD_TOKEN);
