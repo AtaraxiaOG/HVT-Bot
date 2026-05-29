@@ -13,7 +13,8 @@ const {
   StringSelectMenuOptionBuilder,
   ButtonBuilder,
   ButtonStyle,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  MessageFlags
 } = require('discord.js');
 
 const fs = require('fs');
@@ -32,13 +33,10 @@ const APPROVAL_CHANNEL_ID = process.env.APPROVAL_CHANNEL_ID || '';
 
 const DAILY_TIMEZONE = process.env.DAILY_TIMEZONE || 'America/Chicago';
 
-// Change this in Railway Variables whenever you want to change the daily reward.
-// Example Railway variable:
+// Add this in Railway Variables:
 // DAILY_ITEMS=PalSphere:50 GoldCoin:10000
 const DAILY_ITEMS = process.env.DAILY_ITEMS || 'PalSphere:50 GoldCoin:10000';
 
-// Temporary in-memory storage for dropdown choices.
-// This does not need to persist because it is only used during the /link interaction.
 const pendingChoices = new Map();
 
 // =========================
@@ -104,17 +102,8 @@ async function initDb() {
     )
   `);
 
-  await addColumnIfMissing(
-    'linked_users',
-    'target_id',
-    'target_id TEXT'
-  );
-
-  await addColumnIfMissing(
-    'linked_users',
-    'paldefender_user_id',
-    'paldefender_user_id TEXT'
-  );
+  await addColumnIfMissing('linked_users', 'target_id', 'target_id TEXT');
+  await addColumnIfMissing('linked_users', 'paldefender_user_id', 'paldefender_user_id TEXT');
 
   await dbRun(`
     CREATE TABLE IF NOT EXISTS pending_links (
@@ -130,11 +119,7 @@ async function initDb() {
     )
   `);
 
-  await addColumnIfMissing(
-    'pending_links',
-    'paldefender_user_id',
-    'paldefender_user_id TEXT'
-  );
+  await addColumnIfMissing('pending_links', 'paldefender_user_id', 'paldefender_user_id TEXT');
 
   await dbRun(`
     CREATE TABLE IF NOT EXISTS daily_claims (
@@ -144,7 +129,6 @@ async function initDb() {
     )
   `);
 
-  // Helps older links from the previous setup keep working.
   await dbRun(`
     UPDATE linked_users
     SET paldefender_user_id = target_id
@@ -222,7 +206,9 @@ async function connectRcon() {
   }
 }
 
-async function sendRconCommand(command) {
+async function sendRconCommand(command, options = {}) {
+  const allowTimeout = options.allowTimeout || false;
+
   try {
     if (!rcon || !rcon.authenticated) {
       console.log('RCON disconnected. Reconnecting...');
@@ -242,8 +228,22 @@ async function sendRconCommand(command) {
 
     return response || '';
   } catch (err) {
+    const message = String(err?.message || err);
+
+    if (allowTimeout && message.toLowerCase().includes('timeout')) {
+      console.warn(
+        `[RCON TIMEOUT IGNORED] Command was sent, but no response came back: ${command}`
+      );
+
+      rcon = null;
+
+      return '';
+    }
+
     console.error('RCON command failed:', err);
+
     rcon = null;
+
     throw err;
   }
 }
@@ -251,7 +251,7 @@ async function sendRconCommand(command) {
 connectRcon();
 
 // =========================
-// PALDEFENDER USER ID HELPERS
+// PALDEFENDER HELPERS
 // =========================
 function normalizePalDefenderUserId(rawId) {
   let id = String(rawId || '').trim();
@@ -260,18 +260,15 @@ function normalizePalDefenderUserId(rawId) {
 
   id = id.replace(/^"|"$/g, '');
 
-  // Already formatted for PalDefender.
   if (/^(steam|gdk)_/i.test(id)) {
     const [prefix, value] = id.split('_');
     return `${prefix.toLowerCase()}_${value}`;
   }
 
-  // Most SteamID64 values are 17 digits and begin with 765.
   if (/^765\d{14}$/.test(id)) {
     return `steam_${id}`;
   }
 
-  // If it is already another PalDefender-readable value, leave it alone.
   return id;
 }
 
@@ -305,7 +302,7 @@ function looksLikeRconError(response) {
 }
 
 // =========================
-// PALWORLD SHOWPLAYERS PARSING
+// SHOWPLAYERS PARSING
 // =========================
 function parseShowPlayers(output) {
   const lines = String(output || '')
@@ -316,8 +313,6 @@ function parseShowPlayers(output) {
   const players = [];
 
   for (const line of lines) {
-    // Palworld ShowPlayers usually returns:
-    // name,playeruid,steamid
     const parts = line.split(',').map(part => part.trim());
 
     if (parts.length < 2) continue;
@@ -418,7 +413,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('pdtest')
-    .setDescription('Staff only: test whether PalDefender RCON commands are working')
+    .setDescription('Staff only: test normal Palworld RCON connection')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ].map(command => command.toJSON());
 
@@ -445,7 +440,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -478,15 +473,12 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
   await dbReady;
 
-  // =========================
-  // SLASH COMMANDS
-  // =========================
   if (interaction.isChatInputCommand()) {
-    // -------------------------
+    // =========================
     // /link
-    // -------------------------
+    // =========================
     if (interaction.commandName === 'link') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       let output;
 
@@ -494,7 +486,7 @@ client.on('interactionCreate', async interaction => {
         output = await sendRconCommand('ShowPlayers');
       } catch (err) {
         return interaction.editReply(
-          'I could not reach Palworld RCON. Check your Railway RCON variables and make sure the Palworld server is online.'
+          'I could not reach Palworld RCON. Check Railway variables and make sure the Palworld server is online.'
         );
       }
 
@@ -531,9 +523,9 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // -------------------------
+    // =========================
     // /unlink
-    // -------------------------
+    // =========================
     if (interaction.commandName === 'unlink') {
       await dbRun(
         `DELETE FROM linked_users WHERE discord_id = ?`,
@@ -547,13 +539,13 @@ client.on('interactionCreate', async interaction => {
 
       return interaction.reply({
         content: 'Your Palworld link has been removed.',
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
-    // -------------------------
+    // =========================
     // /whoami
-    // -------------------------
+    // =========================
     if (interaction.commandName === 'whoami') {
       const link = await dbGet(
         `SELECT * FROM linked_users WHERE discord_id = ?`,
@@ -563,7 +555,7 @@ client.on('interactionCreate', async interaction => {
       if (!link) {
         return interaction.reply({
           content: 'You are not linked yet. Use `/link` while your character is online.',
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
       }
 
@@ -574,15 +566,15 @@ client.on('interactionCreate', async interaction => {
           `You are linked to **${link.pal_name}**.\n` +
           `PalDefender UserId: \`${palDefenderUserId || 'missing'}\`\n\n` +
           `If /daily says player not found, staff may need to run /setpdid for your account.`,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
-    // -------------------------
+    // =========================
     // /daily
-    // -------------------------
+    // =========================
     if (interaction.commandName === 'daily') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const link = await dbGet(
         `SELECT * FROM linked_users WHERE discord_id = ?`,
@@ -624,12 +616,14 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
+      // IMPORTANT:
+      // DatHost console / RCON does NOT need a slash here.
       const command = `giveitems ${palDefenderUserId} ${dailyItems}`;
 
       let response;
 
       try {
-        response = await sendRconCommand(command);
+        response = await sendRconCommand(command, { allowTimeout: true });
       } catch (err) {
         console.error('Failed to give daily reward:', err);
 
@@ -638,7 +632,7 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
-      if (looksLikeRconError(response)) {
+      if (response && looksLikeRconError(response)) {
         return interaction.editReply(
           `PalDefender rejected the reward command.\n\n` +
           `Command sent:\n\`${command}\`\n\n` +
@@ -668,9 +662,9 @@ client.on('interactionCreate', async interaction => {
       );
     }
 
-    // -------------------------
+    // =========================
     // /setpdid
-    // -------------------------
+    // =========================
     if (interaction.commandName === 'setpdid') {
       const targetUser = interaction.options.getUser('discord_user');
       const inputId = interaction.options.getString('paldefender_userid');
@@ -685,7 +679,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content:
             `${targetUser} is not linked yet. Have them run /link first, then use /setpdid if needed.`,
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
       }
 
@@ -709,20 +703,21 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({
         content:
           `Updated ${targetUser}'s PalDefender UserId to:\n\`${palDefenderUserId}\``,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
-    // -------------------------
+    // =========================
     // /pdtest
-    // -------------------------
+    // =========================
     if (interaction.commandName === 'pdtest') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       let response;
 
       try {
-        response = await sendRconCommand('getrconcmds');
+        // Normal Palworld RCON test. This should return server info.
+        response = await sendRconCommand('Info');
       } catch (err) {
         return interaction.editReply(
           'RCON failed. Check Railway logs and your Palworld RCON settings.'
@@ -730,7 +725,7 @@ client.on('interactionCreate', async interaction => {
       }
 
       return interaction.editReply(
-        `PalDefender RCON test response:\n\`\`\`\n${String(response).slice(0, 1800)}\n\`\`\``
+        `RCON test response:\n\`\`\`\n${String(response).slice(0, 1800)}\n\`\`\``
       );
     }
   }
@@ -746,7 +741,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.user.id !== ownerId) {
       return interaction.reply({
         content: 'This link menu is not for you.',
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
@@ -885,7 +880,7 @@ client.on('interactionCreate', async interaction => {
     if (!pending) {
       return interaction.reply({
         content: 'This link request no longer exists or was already handled.',
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
