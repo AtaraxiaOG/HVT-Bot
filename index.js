@@ -624,7 +624,7 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
-      const command = `/giveitems ${palDefenderUserId} ${dailyItems}`;
+      const command = `giveitems ${palDefenderUserId} ${dailyItems}`;
 
       let response;
 
@@ -722,7 +722,7 @@ client.on('interactionCreate', async interaction => {
       let response;
 
       try {
-        response = await sendRconCommand('/getrconcmds');
+        response = await sendRconCommand('getrconcmds');
       } catch (err) {
         return interaction.editReply(
           'RCON failed. Check Railway logs and your Palworld RCON settings.'
