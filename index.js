@@ -12,7 +12,8 @@ const {
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  PermissionFlagsBits
 } = require('discord.js');
 
 const fs = require('fs');
@@ -23,14 +24,21 @@ const sqlite3 = require('sqlite3').verbose();
 // CONFIG
 // =========================
 const DB_PATH = process.env.PALBOT_DB_PATH || '/data/hvt-bot.sqlite';
+
 const LINK_APPROVAL_REQUIRED =
   String(process.env.LINK_APPROVAL_REQUIRED || 'true').toLowerCase() === 'true';
 
 const APPROVAL_CHANNEL_ID = process.env.APPROVAL_CHANNEL_ID || '';
-const DAILY_TIMEZONE = process.env.DAILY_TIMEZONE || 'UTC';
 
-// In-memory choices for active /link dropdowns.
-// This does not need to persist because it is only used during the short linking interaction.
+const DAILY_TIMEZONE = process.env.DAILY_TIMEZONE || 'America/Chicago';
+
+// Change this in Railway Variables whenever you want to change the daily reward.
+// Example Railway variable:
+// DAILY_ITEMS=PalSphere:50 GoldCoin:10000
+const DAILY_ITEMS = process.env.DAILY_ITEMS || 'PalSphere:50 GoldCoin:10000';
+
+// Temporary in-memory storage for dropdown choices.
+// This does not need to persist because it is only used during the /link interaction.
 const pendingChoices = new Map();
 
 // =========================
@@ -58,6 +66,29 @@ function dbGet(sql, params = []) {
   });
 }
 
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, function (err, rows) {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+async function columnExists(tableName, columnName) {
+  const columns = await dbAll(`PRAGMA table_info(${tableName})`);
+  return columns.some(col => col.name === columnName);
+}
+
+async function addColumnIfMissing(tableName, columnName, columnSql) {
+  const exists = await columnExists(tableName, columnName);
+
+  if (!exists) {
+    await dbRun(`ALTER TABLE ${tableName} ADD COLUMN ${columnSql}`);
+    console.log(`Added missing column ${columnName} to ${tableName}`);
+  }
+}
+
 async function initDb() {
   await dbRun(`
     CREATE TABLE IF NOT EXISTS linked_users (
@@ -66,11 +97,24 @@ async function initDb() {
       pal_name TEXT NOT NULL,
       player_uid TEXT,
       steam_id TEXT,
-      target_id TEXT NOT NULL,
+      target_id TEXT,
+      paldefender_user_id TEXT,
       linked_at TEXT NOT NULL,
       approved_by TEXT
     )
   `);
+
+  await addColumnIfMissing(
+    'linked_users',
+    'target_id',
+    'target_id TEXT'
+  );
+
+  await addColumnIfMissing(
+    'linked_users',
+    'paldefender_user_id',
+    'paldefender_user_id TEXT'
+  );
 
   await dbRun(`
     CREATE TABLE IF NOT EXISTS pending_links (
@@ -80,10 +124,17 @@ async function initDb() {
       pal_name TEXT NOT NULL,
       player_uid TEXT,
       steam_id TEXT,
-      target_id TEXT NOT NULL,
+      target_id TEXT,
+      paldefender_user_id TEXT,
       created_at TEXT NOT NULL
     )
   `);
+
+  await addColumnIfMissing(
+    'pending_links',
+    'paldefender_user_id',
+    'paldefender_user_id TEXT'
+  );
 
   await dbRun(`
     CREATE TABLE IF NOT EXISTS daily_claims (
@@ -91,6 +142,16 @@ async function initDb() {
       last_claim_date TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
+  `);
+
+  // Helps older links from the previous setup keep working.
+  await dbRun(`
+    UPDATE linked_users
+    SET paldefender_user_id = target_id
+    WHERE
+      (paldefender_user_id IS NULL OR paldefender_user_id = '')
+      AND target_id IS NOT NULL
+      AND target_id != ''
   `);
 
   console.log(`SQLite database ready at ${DB_PATH}`);
@@ -108,16 +169,18 @@ async function saveLinkedUser(link, approvedBy = null) {
       player_uid,
       steam_id,
       target_id,
+      paldefender_user_id,
       linked_at,
       approved_by
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(discord_id) DO UPDATE SET
       discord_tag = excluded.discord_tag,
       pal_name = excluded.pal_name,
       player_uid = excluded.player_uid,
       steam_id = excluded.steam_id,
       target_id = excluded.target_id,
+      paldefender_user_id = excluded.paldefender_user_id,
       linked_at = excluded.linked_at,
       approved_by = excluded.approved_by
     `,
@@ -127,7 +190,8 @@ async function saveLinkedUser(link, approvedBy = null) {
       link.palName,
       link.playerUid || '',
       link.steamId || '',
-      link.targetId,
+      link.targetId || '',
+      link.palDefenderUserId || '',
       new Date().toISOString(),
       approvedBy
     ]
@@ -170,7 +234,12 @@ async function sendRconCommand(command) {
       }
     }
 
+    console.log(`[RCON COMMAND] ${command}`);
+
     const response = await rcon.send(command);
+
+    console.log(`[RCON RESPONSE] ${response}`);
+
     return response || '';
   } catch (err) {
     console.error('RCON command failed:', err);
@@ -182,7 +251,61 @@ async function sendRconCommand(command) {
 connectRcon();
 
 // =========================
-// PALWORLD PLAYER PARSING
+// PALDEFENDER USER ID HELPERS
+// =========================
+function normalizePalDefenderUserId(rawId) {
+  let id = String(rawId || '').trim();
+
+  if (!id) return '';
+
+  id = id.replace(/^"|"$/g, '');
+
+  // Already formatted for PalDefender.
+  if (/^(steam|gdk)_/i.test(id)) {
+    const [prefix, value] = id.split('_');
+    return `${prefix.toLowerCase()}_${value}`;
+  }
+
+  // Most SteamID64 values are 17 digits and begin with 765.
+  if (/^765\d{14}$/.test(id)) {
+    return `steam_${id}`;
+  }
+
+  // If it is already another PalDefender-readable value, leave it alone.
+  return id;
+}
+
+function getPalDefenderUserIdFromLink(link) {
+  if (!link) return '';
+
+  const stored =
+    link.paldefender_user_id ||
+    link.target_id ||
+    link.steam_id ||
+    link.player_uid ||
+    '';
+
+  return normalizePalDefenderUserId(stored);
+}
+
+function looksLikeRconError(response) {
+  const text = String(response || '').toLowerCase();
+
+  return (
+    text.includes('unknown command') ||
+    text.includes('not found') ||
+    text.includes('notfound') ||
+    text.includes('invalid') ||
+    text.includes('failed') ||
+    text.includes('error') ||
+    text.includes('does not exist') ||
+    text.includes('no player') ||
+    text.includes('player not')
+  );
+}
+
+// =========================
+// PALWORLD SHOWPLAYERS PARSING
 // =========================
 function parseShowPlayers(output) {
   const lines = String(output || '')
@@ -193,7 +316,7 @@ function parseShowPlayers(output) {
   const players = [];
 
   for (const line of lines) {
-    // Palworld ShowPlayers commonly returns CSV-style output:
+    // Palworld ShowPlayers usually returns:
     // name,playeruid,steamid
     const parts = line.split(',').map(part => part.trim());
 
@@ -211,17 +334,10 @@ function parseShowPlayers(output) {
 
     const palName = parts[0];
     const playerUid = parts[1] || '';
-    const steamIdRaw = parts[2] || '';
+    const steamId = parts[2] || '';
 
-    const steamId =
-      steamIdRaw &&
-      !['0', 'none', 'null', 'undefined', '-'].includes(steamIdRaw.toLowerCase())
-        ? steamIdRaw
-        : '';
-
-    // For Steam players, use SteamID if available.
-    // For Xbox/Game Pass/console players, use PlayerUID.
     const targetId = steamId || playerUid;
+    const palDefenderUserId = normalizePalDefenderUserId(targetId);
 
     if (!palName || !targetId) continue;
 
@@ -229,7 +345,8 @@ function parseShowPlayers(output) {
       palName,
       playerUid,
       steamId,
-      targetId
+      targetId,
+      palDefenderUserId
     });
   }
 
@@ -237,9 +354,18 @@ function parseShowPlayers(output) {
 }
 
 function getTodayString() {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: DAILY_TIMEZONE
-  }).format(new Date());
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: DAILY_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date());
+
+  const year = parts.find(part => part.type === 'year').value;
+  const month = parts.find(part => part.type === 'month').value;
+  const day = parts.find(part => part.type === 'day').value;
+
+  return `${year}-${month}-${day}`;
 }
 
 // =========================
@@ -271,9 +397,34 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('daily')
-    .setDescription('Claim your daily Palworld reward')
+    .setDescription('Claim your daily Palworld reward'),
+
+  new SlashCommandBuilder()
+    .setName('setpdid')
+    .setDescription('Staff only: set a user’s PalDefender UserId manually')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption(option =>
+      option
+        .setName('discord_user')
+        .setDescription('The linked Discord user')
+        .setRequired(true)
+    )
+    .addStringOption(option =>
+      option
+        .setName('paldefender_userid')
+        .setDescription('Example: steam_7656119... or gdk_253...')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('pdtest')
+    .setDescription('Staff only: test whether PalDefender RCON commands are working')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ].map(command => command.toJSON());
 
+// =========================
+// REGISTER SLASH COMMANDS
+// =========================
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 (async () => {
@@ -294,7 +445,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-client.once('clientReady', () => {
+client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -303,14 +454,19 @@ client.once('clientReady', () => {
 // =========================
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
+
   if (message.channel.id !== process.env.CHANNEL_ID) return;
+
+  const cleanMessage = message.content
+    .replace(/\r?\n/g, ' ')
+    .slice(0, 250);
 
   try {
     await sendRconCommand(
-      `Broadcast [Discord]_${message.author.username}:_${message.content.replace(/\s+/g, '_')}`
+      `Broadcast [Discord] ${message.author.username}: ${cleanMessage}`
     );
 
-    console.log(`[Discord Relay] ${message.author.username}: ${message.content}`);
+    console.log(`[Discord Relay] ${message.author.username}: ${cleanMessage}`);
   } catch (err) {
     console.log('Failed to send Discord message to Palworld.');
   }
@@ -338,7 +494,7 @@ client.on('interactionCreate', async interaction => {
         output = await sendRconCommand('ShowPlayers');
       } catch (err) {
         return interaction.editReply(
-          'I could not reach Palworld RCON. Check your Railway RCON variables and make sure the server is online.'
+          'I could not reach Palworld RCON. Check your Railway RCON variables and make sure the Palworld server is online.'
         );
       }
 
@@ -359,7 +515,9 @@ client.on('interactionCreate', async interaction => {
           players.map((player, index) =>
             new StringSelectMenuOptionBuilder()
               .setLabel(player.palName.slice(0, 100))
-              .setDescription(`ID: ${player.targetId}`.slice(0, 100))
+              .setDescription(
+                `PD ID: ${player.palDefenderUserId || player.targetId}`.slice(0, 100)
+              )
               .setValue(String(index))
           )
         );
@@ -379,6 +537,11 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'unlink') {
       await dbRun(
         `DELETE FROM linked_users WHERE discord_id = ?`,
+        [interaction.user.id]
+      );
+
+      await dbRun(
+        `DELETE FROM daily_claims WHERE discord_id = ?`,
         [interaction.user.id]
       );
 
@@ -404,10 +567,13 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
+      const palDefenderUserId = getPalDefenderUserIdFromLink(link);
+
       return interaction.reply({
         content:
           `You are linked to **${link.pal_name}**.\n` +
-          `Target ID: \`${link.target_id}\``,
+          `PalDefender UserId: \`${palDefenderUserId || 'missing'}\`\n\n` +
+          `If /daily says player not found, staff may need to run /setpdid for your account.`,
         ephemeral: true
       });
     }
@@ -429,6 +595,14 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
+      const palDefenderUserId = getPalDefenderUserIdFromLink(link);
+
+      if (!palDefenderUserId) {
+        return interaction.editReply(
+          'Your link is missing a PalDefender UserId. Ask staff to use `/setpdid` for your account.'
+        );
+      }
+
       const today = getTodayString();
 
       const claim = await dbGet(
@@ -442,37 +616,122 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
-      try {
-        // Keep these if your mod/server supports Give commands.
-        // If RewardsEngine uses different commands, replace these two lines.
-        await sendRconCommand(`Give ${link.target_id} PalSphere 50`);
-        await sendRconCommand(`Give ${link.target_id} Money 10000`);
+      const dailyItems = String(DAILY_ITEMS || '').trim();
 
-        await dbRun(
-          `
-          INSERT INTO daily_claims (
-            discord_id,
-            last_claim_date,
-            updated_at
-          )
-          VALUES (?, ?, ?)
-          ON CONFLICT(discord_id) DO UPDATE SET
-            last_claim_date = excluded.last_claim_date,
-            updated_at = excluded.updated_at
-          `,
-          [interaction.user.id, today, new Date().toISOString()]
-        );
-
+      if (!dailyItems) {
         return interaction.editReply(
-          `Daily reward claimed for **${link.pal_name}**.`
+          'DAILY_ITEMS is empty in Railway Variables. Add something like `PalSphere:50 GoldCoin:10000`.'
         );
+      }
+
+      const command = `/giveitems ${palDefenderUserId} ${dailyItems}`;
+
+      let response;
+
+      try {
+        response = await sendRconCommand(command);
       } catch (err) {
         console.error('Failed to give daily reward:', err);
 
         return interaction.editReply(
-          'Failed to claim reward. RCON connected, but the reward command may have failed. Check Railway logs.'
+          'Failed to claim reward because RCON failed. Check Railway logs.'
         );
       }
+
+      if (looksLikeRconError(response)) {
+        return interaction.editReply(
+          `PalDefender rejected the reward command.\n\n` +
+          `Command sent:\n\`${command}\`\n\n` +
+          `Response:\n\`\`\`\n${String(response).slice(0, 1500)}\n\`\`\`\n\n` +
+          `If this says player not found, staff should run /setpdid with the correct PalDefender UserId.`
+        );
+      }
+
+      await dbRun(
+        `
+        INSERT INTO daily_claims (
+          discord_id,
+          last_claim_date,
+          updated_at
+        )
+        VALUES (?, ?, ?)
+        ON CONFLICT(discord_id) DO UPDATE SET
+          last_claim_date = excluded.last_claim_date,
+          updated_at = excluded.updated_at
+        `,
+        [interaction.user.id, today, new Date().toISOString()]
+      );
+
+      return interaction.editReply(
+        `Daily reward claimed for **${link.pal_name}**.\n\n` +
+        `Reward: \`${dailyItems}\``
+      );
+    }
+
+    // -------------------------
+    // /setpdid
+    // -------------------------
+    if (interaction.commandName === 'setpdid') {
+      const targetUser = interaction.options.getUser('discord_user');
+      const inputId = interaction.options.getString('paldefender_userid');
+      const palDefenderUserId = normalizePalDefenderUserId(inputId);
+
+      const link = await dbGet(
+        `SELECT * FROM linked_users WHERE discord_id = ?`,
+        [targetUser.id]
+      );
+
+      if (!link) {
+        return interaction.reply({
+          content:
+            `${targetUser} is not linked yet. Have them run /link first, then use /setpdid if needed.`,
+          ephemeral: true
+        });
+      }
+
+      await dbRun(
+        `
+        UPDATE linked_users
+        SET
+          paldefender_user_id = ?,
+          target_id = ?,
+          linked_at = ?
+        WHERE discord_id = ?
+        `,
+        [
+          palDefenderUserId,
+          palDefenderUserId,
+          new Date().toISOString(),
+          targetUser.id
+        ]
+      );
+
+      return interaction.reply({
+        content:
+          `Updated ${targetUser}'s PalDefender UserId to:\n\`${palDefenderUserId}\``,
+        ephemeral: true
+      });
+    }
+
+    // -------------------------
+    // /pdtest
+    // -------------------------
+    if (interaction.commandName === 'pdtest') {
+      await interaction.deferReply({ ephemeral: true });
+
+      let response;
+
+      try {
+        response = await sendRconCommand('/getrconcmds');
+      } catch (err) {
+        return interaction.editReply(
+          'RCON failed. Check Railway logs and your Palworld RCON settings.'
+        );
+      }
+
+      return interaction.editReply(
+        `PalDefender RCON test response:\n\`\`\`\n${String(response).slice(0, 1800)}\n\`\`\``
+      );
     }
   }
 
@@ -508,7 +767,8 @@ client.on('interactionCreate', async interaction => {
       palName: selected.palName,
       playerUid: selected.playerUid,
       steamId: selected.steamId,
-      targetId: selected.targetId
+      targetId: selected.targetId,
+      palDefenderUserId: selected.palDefenderUserId
     };
 
     pendingChoices.delete(interaction.user.id);
@@ -517,7 +777,7 @@ client.on('interactionCreate', async interaction => {
       if (!APPROVAL_CHANNEL_ID) {
         return interaction.update({
           content:
-            'Link approval is enabled, but APPROVAL_CHANNEL_ID is missing in Railway variables.',
+            'Link approval is enabled, but APPROVAL_CHANNEL_ID is missing in Railway Variables.',
           components: []
         });
       }
@@ -534,9 +794,10 @@ client.on('interactionCreate', async interaction => {
           player_uid,
           steam_id,
           target_id,
+          paldefender_user_id,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           pendingId,
@@ -545,7 +806,8 @@ client.on('interactionCreate', async interaction => {
           linkData.palName,
           linkData.playerUid || '',
           linkData.steamId || '',
-          linkData.targetId,
+          linkData.targetId || '',
+          linkData.palDefenderUserId || '',
           new Date().toISOString()
         ]
       );
@@ -565,14 +827,27 @@ client.on('interactionCreate', async interaction => {
         denyButton
       );
 
-      const approvalChannel = await client.channels.fetch(APPROVAL_CHANNEL_ID);
+      let approvalChannel;
+
+      try {
+        approvalChannel = await client.channels.fetch(APPROVAL_CHANNEL_ID);
+      } catch (err) {
+        console.error('Could not fetch approval channel:', err);
+
+        return interaction.update({
+          content:
+            'I could not find the approval channel. Check APPROVAL_CHANNEL_ID in Railway Variables.',
+          components: []
+        });
+      }
 
       await approvalChannel.send({
         content:
           `New Palworld link request:\n\n` +
           `Discord: <@${linkData.discordId}> / ${linkData.discordTag}\n` +
           `Palworld Name: **${linkData.palName}**\n` +
-          `Target ID: \`${linkData.targetId}\`\n\n` +
+          `ShowPlayers Target ID: \`${linkData.targetId || 'missing'}\`\n` +
+          `PalDefender UserId Guess: \`${linkData.palDefenderUserId || 'missing'}\`\n\n` +
           `Approve only if this Discord user really owns this character.`,
         components: [row]
       });
@@ -588,7 +863,8 @@ client.on('interactionCreate', async interaction => {
 
     return interaction.update({
       content:
-        `Successfully linked your Discord to **${linkData.palName}**.\nTarget ID: \`${linkData.targetId}\``,
+        `Successfully linked your Discord to **${linkData.palName}**.\n` +
+        `PalDefender UserId: \`${linkData.palDefenderUserId || 'missing'}\``,
       components: []
     });
   }
@@ -633,7 +909,8 @@ client.on('interactionCreate', async interaction => {
         palName: pending.pal_name,
         playerUid: pending.player_uid,
         steamId: pending.steam_id,
-        targetId: pending.target_id
+        targetId: pending.target_id,
+        palDefenderUserId: pending.paldefender_user_id || pending.target_id
       },
       interaction.user.id
     );
@@ -645,7 +922,8 @@ client.on('interactionCreate', async interaction => {
 
     return interaction.update({
       content:
-        `Approved link: <@${pending.discord_id}> → **${pending.pal_name}**.\nTarget ID: \`${pending.target_id}\``,
+        `Approved link: <@${pending.discord_id}> → **${pending.pal_name}**.\n` +
+        `PalDefender UserId: \`${pending.paldefender_user_id || pending.target_id || 'missing'}\``,
       components: []
     });
   }
