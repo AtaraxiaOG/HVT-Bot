@@ -13,8 +13,7 @@ const {
   StringSelectMenuOptionBuilder,
   ButtonBuilder,
   ButtonStyle,
-  PermissionFlagsBits,
-  MessageFlags
+  PermissionFlagsBits
 } = require('discord.js');
 
 const fs = require('fs');
@@ -36,6 +35,10 @@ const DAILY_TIMEZONE = process.env.DAILY_TIMEZONE || 'America/Chicago';
 // Add this in Railway Variables:
 // DAILY_ITEMS=PalSphere:50 GoldCoin:10000
 const DAILY_ITEMS = process.env.DAILY_ITEMS || 'PalSphere:50 GoldCoin:10000';
+
+// Discord ephemeral response flag.
+// Using 64 avoids the old "ephemeral is deprecated" warning.
+const EPHEMERAL = 64;
 
 const pendingChoices = new Map();
 
@@ -119,6 +122,7 @@ async function initDb() {
     )
   `);
 
+  await addColumnIfMissing('pending_links', 'target_id', 'target_id TEXT');
   await addColumnIfMissing('pending_links', 'paldefender_user_id', 'paldefender_user_id TEXT');
 
   await dbRun(`
@@ -395,6 +399,17 @@ const commands = [
     .setDescription('Claim your daily Palworld reward'),
 
   new SlashCommandBuilder()
+    .setName('resetdaily')
+    .setDescription('Staff only: reset a user’s daily claim cooldown')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption(option =>
+      option
+        .setName('discord_user')
+        .setDescription('The Discord user to reset')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
     .setName('setpdid')
     .setDescription('Staff only: set a user’s PalDefender UserId manually')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -478,7 +493,7 @@ client.on('interactionCreate', async interaction => {
     // /link
     // =========================
     if (interaction.commandName === 'link') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
 
       let output;
 
@@ -538,8 +553,8 @@ client.on('interactionCreate', async interaction => {
       );
 
       return interaction.reply({
-        content: 'Your Palworld link has been removed.',
-        flags: MessageFlags.Ephemeral
+        content: 'Your Palworld link and daily cooldown have been removed.',
+        flags: EPHEMERAL
       });
     }
 
@@ -555,7 +570,7 @@ client.on('interactionCreate', async interaction => {
       if (!link) {
         return interaction.reply({
           content: 'You are not linked yet. Use `/link` while your character is online.',
-          flags: MessageFlags.Ephemeral
+          flags: EPHEMERAL
         });
       }
 
@@ -566,7 +581,7 @@ client.on('interactionCreate', async interaction => {
           `You are linked to **${link.pal_name}**.\n` +
           `PalDefender UserId: \`${palDefenderUserId || 'missing'}\`\n\n` +
           `If /daily says player not found, staff may need to run /setpdid for your account.`,
-        flags: MessageFlags.Ephemeral
+        flags: EPHEMERAL
       });
     }
 
@@ -574,7 +589,7 @@ client.on('interactionCreate', async interaction => {
     // /daily
     // =========================
     if (interaction.commandName === 'daily') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
 
       const link = await dbGet(
         `SELECT * FROM linked_users WHERE discord_id = ?`,
@@ -604,7 +619,7 @@ client.on('interactionCreate', async interaction => {
 
       if (claim && claim.last_claim_date === today) {
         return interaction.editReply(
-          'You already claimed your daily reward today.'
+          'You already claimed your daily reward today. Staff can reset your cooldown with `/resetdaily`.'
         );
       }
 
@@ -616,7 +631,6 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
-      // IMPORTANT:
       // DatHost console / RCON does NOT need a slash here.
       const command = `giveitems ${palDefenderUserId} ${dailyItems}`;
 
@@ -663,6 +677,25 @@ client.on('interactionCreate', async interaction => {
     }
 
     // =========================
+    // /resetdaily
+    // =========================
+    if (interaction.commandName === 'resetdaily') {
+      const targetUser =
+        interaction.options.getUser('discord_user') || interaction.user;
+
+      await dbRun(
+        `DELETE FROM daily_claims WHERE discord_id = ?`,
+        [targetUser.id]
+      );
+
+      return interaction.reply({
+        content:
+          `Daily cooldown reset for ${targetUser}. They can now use /daily again.`,
+        flags: EPHEMERAL
+      });
+    }
+
+    // =========================
     // /setpdid
     // =========================
     if (interaction.commandName === 'setpdid') {
@@ -679,7 +712,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content:
             `${targetUser} is not linked yet. Have them run /link first, then use /setpdid if needed.`,
-          flags: MessageFlags.Ephemeral
+          flags: EPHEMERAL
         });
       }
 
@@ -703,7 +736,7 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({
         content:
           `Updated ${targetUser}'s PalDefender UserId to:\n\`${palDefenderUserId}\``,
-        flags: MessageFlags.Ephemeral
+        flags: EPHEMERAL
       });
     }
 
@@ -711,12 +744,11 @@ client.on('interactionCreate', async interaction => {
     // /pdtest
     // =========================
     if (interaction.commandName === 'pdtest') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
 
       let response;
 
       try {
-        // Normal Palworld RCON test. This should return server info.
         response = await sendRconCommand('Info');
       } catch (err) {
         return interaction.editReply(
@@ -741,7 +773,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.user.id !== ownerId) {
       return interaction.reply({
         content: 'This link menu is not for you.',
-        flags: MessageFlags.Ephemeral
+        flags: EPHEMERAL
       });
     }
 
@@ -880,7 +912,7 @@ client.on('interactionCreate', async interaction => {
     if (!pending) {
       return interaction.reply({
         content: 'This link request no longer exists or was already handled.',
-        flags: MessageFlags.Ephemeral
+        flags: EPHEMERAL
       });
     }
 
