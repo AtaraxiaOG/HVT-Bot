@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const { Rcon } = require('rcon-client');
+const axios = require('axios');
 
 const {
   Client,
@@ -32,8 +33,6 @@ const APPROVAL_CHANNEL_ID = process.env.APPROVAL_CHANNEL_ID || '';
 
 const DAILY_TIMEZONE = process.env.DAILY_TIMEZONE || 'America/Chicago';
 
-// Railway Variable example:
-// DAILY_ITEMS=PalSphere:50 GoldCoin:10000
 const DAILY_ITEMS = process.env.DAILY_ITEMS || 'PalSphere:50 GoldCoin:10000';
 
 const EPHEMERAL = 64;
@@ -131,7 +130,7 @@ async function initDb() {
     )
   `);
 
-  // Fix bad old links that saved only GDK/XBOX/STEAM as the player ID.
+  // Clear old broken links that saved only GDK/XBOX/STEAM.
   await dbRun(`
     UPDATE linked_users
     SET paldefender_user_id = ''
@@ -142,16 +141,6 @@ async function initDb() {
     UPDATE linked_users
     SET target_id = ''
     WHERE LOWER(target_id) IN ('gdk', 'xbox', 'steam')
-  `);
-
-  await dbRun(`
-    UPDATE linked_users
-    SET paldefender_user_id = target_id
-    WHERE
-      (paldefender_user_id IS NULL OR paldefender_user_id = '')
-      AND target_id IS NOT NULL
-      AND target_id != ''
-      AND LOWER(target_id) NOT IN ('gdk', 'xbox', 'steam')
   `);
 
   console.log(`SQLite database ready at ${DB_PATH}`);
@@ -265,6 +254,125 @@ async function sendRconCommand(command, options = {}) {
 connectRcon();
 
 // =========================
+// REST API HELPERS
+// =========================
+function getRestBaseUrl() {
+  let url = String(process.env.PALWORLD_REST_URL || '').trim();
+
+  if (!url) return '';
+
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    url = `http://${url}`;
+  }
+
+  url = url.replace(/\/$/, '');
+
+  if (!url.endsWith('/v1/api')) {
+    url = `${url}/v1/api`;
+  }
+
+  return url;
+}
+
+function normalizePlayerIdForCompare(id) {
+  return String(id || '')
+    .replace(/-/g, '')
+    .replace(/\s+/g, '')
+    .trim()
+    .toUpperCase();
+}
+
+async function fetchRestPlayers() {
+  const baseUrl = getRestBaseUrl();
+
+  if (!baseUrl) {
+    console.warn('PALWORLD_REST_URL is not set. Skipping REST player lookup.');
+    return [];
+  }
+
+  const username = process.env.PALWORLD_REST_USER || 'admin';
+  const password =
+    process.env.PALWORLD_REST_PASSWORD ||
+    process.env.PALWORLD_ADMIN_PASSWORD ||
+    '';
+
+  if (!password) {
+    console.warn('PALWORLD_REST_PASSWORD is not set. Skipping REST player lookup.');
+    return [];
+  }
+
+  const url = `${baseUrl}/players`;
+
+  console.log(`[REST REQUEST] ${url}`);
+
+  const response = await axios.get(url, {
+    auth: {
+      username,
+      password
+    },
+    timeout: 8000
+  });
+
+  const data = response.data || {};
+
+  if (Array.isArray(data.players)) return data.players;
+  if (Array.isArray(data)) return data;
+
+  return [];
+}
+
+async function enrichPlayersWithRestUserIds(players) {
+  let restPlayers = [];
+
+  try {
+    restPlayers = await fetchRestPlayers();
+  } catch (err) {
+    console.warn('Could not fetch REST players:', err.message);
+    return players;
+  }
+
+  console.log(`[REST PLAYERS] Found ${restPlayers.length} player(s)`);
+
+  return players.map(player => {
+    const showPlayersUid = normalizePlayerIdForCompare(player.playerUid);
+    const showPlayersName = String(player.palName || '').trim().toLowerCase();
+
+    const match = restPlayers.find(restPlayer => {
+      const restPlayerId = normalizePlayerIdForCompare(restPlayer.playerId);
+      return restPlayerId && restPlayerId === showPlayersUid;
+    });
+
+    const fallbackNameMatch = restPlayers.find(restPlayer => {
+      const restName = String(restPlayer.name || restPlayer.accountName || '')
+        .trim()
+        .toLowerCase();
+
+      return restName && showPlayersName && restName === showPlayersName;
+    });
+
+    const finalMatch = match || fallbackNameMatch;
+
+    if (!finalMatch || !finalMatch.userId) {
+      return player;
+    }
+
+    const realUserId = normalizePalDefenderUserId(finalMatch.userId);
+
+    if (!realUserId) {
+      return player;
+    }
+
+    return {
+      ...player,
+      targetId: realUserId,
+      palDefenderUserId: realUserId,
+      accountName: finalMatch.accountName || '',
+      restMatched: true
+    };
+  });
+}
+
+// =========================
 // PALDEFENDER HELPERS
 // =========================
 function normalizePalDefenderUserId(rawId) {
@@ -276,7 +384,6 @@ function normalizePalDefenderUserId(rawId) {
 
   const lower = id.toLowerCase();
 
-  // These are platform labels, not real PalDefender UserIds.
   if (['gdk', 'xbox', 'steam'].includes(lower)) {
     return '';
   }
@@ -291,7 +398,6 @@ function normalizePalDefenderUserId(rawId) {
     return `${prefix}_${value}`;
   }
 
-  // SteamID64
   if (/^765\d{14}$/.test(id)) {
     return `steam_${id}`;
   }
@@ -315,24 +421,23 @@ function buildPalDefenderId(playerUid, steamIdRaw) {
   // Already PalDefender formatted.
   if (/^(steam|gdk)_/i.test(raw)) {
     const pdid = normalizePalDefenderUserId(raw);
+
     return {
       targetId: pdid,
       palDefenderUserId: pdid
     };
   }
 
-  // Console/Game Pass often appears as GDK or XBOX in ShowPlayers.
-  // PalDefender needs gdk_<full id>, not just GDK.
+  // GDK/Xbox in ShowPlayers is only a platform marker, not the real UserId.
+  // REST /players will fill the real gdk_253... ID.
   if (lower === 'gdk' || lower === 'xbox') {
-    const pdid = uid ? `gdk_${uid}` : '';
-
     return {
-      targetId: pdid || uid,
-      palDefenderUserId: pdid
+      targetId: uid,
+      palDefenderUserId: ''
     };
   }
 
-  // If the UID itself is already formatted.
+  // UID itself may already be formatted.
   if (/^(steam|gdk)_/i.test(uid)) {
     const pdid = normalizePalDefenderUserId(uid);
 
@@ -342,7 +447,6 @@ function buildPalDefenderId(playerUid, steamIdRaw) {
     };
   }
 
-  // Fallback.
   const fallback = normalizePalDefenderUserId(raw || uid);
 
   return {
@@ -358,7 +462,6 @@ function getPalDefenderUserIdFromLink(link) {
     link.paldefender_user_id ||
     link.target_id ||
     link.steam_id ||
-    link.player_uid ||
     '';
 
   return normalizePalDefenderUserId(stored);
@@ -420,7 +523,8 @@ function parseShowPlayers(output) {
       playerUid,
       steamId: steamIdRaw,
       targetId: ids.targetId,
-      palDefenderUserId: ids.palDefenderUserId
+      palDefenderUserId: ids.palDefenderUserId,
+      restMatched: false
     });
   }
 
@@ -504,6 +608,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName('pdtest')
     .setDescription('Staff only: test normal Palworld RCON connection')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('resttest')
+    .setDescription('Staff only: test Palworld REST player lookup')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ].map(command => command.toJSON());
 
@@ -580,7 +689,8 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
-      const players = parseShowPlayers(output);
+      let players = parseShowPlayers(output);
+      players = await enrichPlayersWithRestUserIds(players);
 
       if (players.length === 0) {
         return interaction.editReply(
@@ -594,21 +704,24 @@ client.on('interactionCreate', async interaction => {
         .setCustomId(`link_select:${interaction.user.id}`)
         .setPlaceholder('Choose your Palworld character')
         .addOptions(
-          players.map((player, index) =>
-            new StringSelectMenuOptionBuilder()
+          players.map((player, index) => {
+            const pdText = player.palDefenderUserId
+              ? player.palDefenderUserId
+              : 'REST/manual ID needed';
+
+            return new StringSelectMenuOptionBuilder()
               .setLabel(player.palName.slice(0, 100))
-              .setDescription(
-                `PD ID: ${player.palDefenderUserId || player.targetId}`.slice(0, 100)
-              )
-              .setValue(String(index))
-          )
+              .setDescription(`PD ID: ${pdText}`.slice(0, 100))
+              .setValue(String(index));
+          })
         );
 
       const row = new ActionRowBuilder().addComponents(select);
 
       return interaction.editReply({
         content:
-          'Choose the Palworld character you are currently online as.\n\nConsole players can do this from Discord on their phone. No in-game typing needed.',
+          'Choose the Palworld character you are currently online as.\n\n' +
+          'The bot will use REST API to save the correct PalDefender UserId automatically.',
         components: [row]
       });
     }
@@ -654,8 +767,9 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({
         content:
           `You are linked to **${link.pal_name}**.\n` +
+          `Palworld UID: \`${link.player_uid || 'missing'}\`\n` +
           `PalDefender UserId: \`${palDefenderUserId || 'missing'}\`\n\n` +
-          `If this says missing, use /unlink and then /link again while you are online, or have staff use /setpdid.`,
+          `For Xbox/Game Pass, this should look like \`gdk_253...\`, not \`gdk_EA5...\`.`,
         flags: EPHEMERAL
       });
     }
@@ -681,7 +795,7 @@ client.on('interactionCreate', async interaction => {
 
       if (!palDefenderUserId) {
         return interaction.editReply(
-          'Your saved PalDefender UserId is missing or invalid. Use `/unlink`, then `/link` again while you are online. Staff can also fix it with `/setpdid`.'
+          'Your saved PalDefender UserId is missing. Use `/unlink`, then `/link` again while you are online. Staff can also fix it with `/setpdid`.'
         );
       }
 
@@ -725,7 +839,7 @@ client.on('interactionCreate', async interaction => {
           `PalDefender rejected the reward command.\n\n` +
           `Command sent:\n\`${command}\`\n\n` +
           `Response:\n\`\`\`\n${String(response).slice(0, 1500)}\n\`\`\`\n\n` +
-          `If this says player not found, staff should run /setpdid with the correct PalDefender UserId.`
+          `If this says player not found, use /unlink and /link again while online, or staff should run /setpdid.`
         );
       }
 
@@ -746,7 +860,8 @@ client.on('interactionCreate', async interaction => {
 
       return interaction.editReply(
         `Daily reward claimed for **${link.pal_name}**.\n\n` +
-        `Reward: \`${dailyItems}\``
+        `Reward: \`${dailyItems}\`\n` +
+        `UserId: \`${palDefenderUserId}\``
       );
     }
 
@@ -840,6 +955,33 @@ client.on('interactionCreate', async interaction => {
 
       return interaction.editReply(
         `RCON test response:\n\`\`\`\n${String(response).slice(0, 1800)}\n\`\`\``
+      );
+    }
+
+    // =========================
+    // /resttest
+    // =========================
+    if (interaction.commandName === 'resttest') {
+      await interaction.deferReply({ flags: EPHEMERAL });
+
+      let players;
+
+      try {
+        players = await fetchRestPlayers();
+      } catch (err) {
+        return interaction.editReply(
+          `REST API failed:\n\`\`\`\n${String(err.message).slice(0, 1800)}\n\`\`\`\n\n` +
+          `Check PALWORLD_REST_URL, PALWORLD_REST_USER, and PALWORLD_REST_PASSWORD in Railway.`
+        );
+      }
+
+      const preview = players.slice(0, 5).map(player => {
+        return `${player.name || player.accountName || 'Unknown'} | userId=${player.userId || 'missing'} | playerId=${player.playerId || 'missing'}`;
+      }).join('\n');
+
+      return interaction.editReply(
+        `REST API is working. Found ${players.length} player(s).\n\n` +
+        `Preview:\n\`\`\`\n${preview || 'No players returned.'}\n\`\`\``
       );
     }
   }
@@ -955,15 +1097,16 @@ client.on('interactionCreate', async interaction => {
           `New Palworld link request:\n\n` +
           `Discord: <@${linkData.discordId}> / ${linkData.discordTag}\n` +
           `Palworld Name: **${linkData.palName}**\n` +
-          `ShowPlayers Target ID: \`${linkData.targetId || 'missing'}\`\n` +
-          `PalDefender UserId Guess: \`${linkData.palDefenderUserId || 'missing'}\`\n\n` +
+          `Palworld UID: \`${linkData.playerUid || 'missing'}\`\n` +
+          `PalDefender UserId: \`${linkData.palDefenderUserId || 'missing'}\`\n\n` +
           `Approve only if this Discord user really owns this character.`,
         components: [row]
       });
 
       return interaction.update({
         content:
-          `Your link request for **${linkData.palName}** was sent to staff for approval.`,
+          `Your link request for **${linkData.palName}** was sent to staff for approval.\n\n` +
+          `Detected PalDefender UserId: \`${linkData.palDefenderUserId || 'missing'}\``,
         components: []
       });
     }
