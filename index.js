@@ -32,12 +32,10 @@ const APPROVAL_CHANNEL_ID = process.env.APPROVAL_CHANNEL_ID || '';
 
 const DAILY_TIMEZONE = process.env.DAILY_TIMEZONE || 'America/Chicago';
 
-// Add this in Railway Variables:
+// Railway Variable example:
 // DAILY_ITEMS=PalSphere:50 GoldCoin:10000
 const DAILY_ITEMS = process.env.DAILY_ITEMS || 'PalSphere:50 GoldCoin:10000';
 
-// Discord ephemeral response flag.
-// Using 64 avoids the old "ephemeral is deprecated" warning.
 const EPHEMERAL = 64;
 
 const pendingChoices = new Map();
@@ -133,6 +131,19 @@ async function initDb() {
     )
   `);
 
+  // Fix bad old links that saved only GDK/XBOX/STEAM as the player ID.
+  await dbRun(`
+    UPDATE linked_users
+    SET paldefender_user_id = ''
+    WHERE LOWER(paldefender_user_id) IN ('gdk', 'xbox', 'steam')
+  `);
+
+  await dbRun(`
+    UPDATE linked_users
+    SET target_id = ''
+    WHERE LOWER(target_id) IN ('gdk', 'xbox', 'steam')
+  `);
+
   await dbRun(`
     UPDATE linked_users
     SET paldefender_user_id = target_id
@@ -140,6 +151,7 @@ async function initDb() {
       (paldefender_user_id IS NULL OR paldefender_user_id = '')
       AND target_id IS NOT NULL
       AND target_id != ''
+      AND LOWER(target_id) NOT IN ('gdk', 'xbox', 'steam')
   `);
 
   console.log(`SQLite database ready at ${DB_PATH}`);
@@ -240,14 +252,12 @@ async function sendRconCommand(command, options = {}) {
       );
 
       rcon = null;
-
       return '';
     }
 
     console.error('RCON command failed:', err);
 
     rcon = null;
-
     throw err;
   }
 }
@@ -264,16 +274,81 @@ function normalizePalDefenderUserId(rawId) {
 
   id = id.replace(/^"|"$/g, '');
 
-  if (/^(steam|gdk)_/i.test(id)) {
-    const [prefix, value] = id.split('_');
-    return `${prefix.toLowerCase()}_${value}`;
+  const lower = id.toLowerCase();
+
+  // These are platform labels, not real PalDefender UserIds.
+  if (['gdk', 'xbox', 'steam'].includes(lower)) {
+    return '';
   }
 
+  if (/^(steam|gdk)_/i.test(id)) {
+    const splitIndex = id.indexOf('_');
+    const prefix = id.slice(0, splitIndex).toLowerCase();
+    const value = id.slice(splitIndex + 1);
+
+    if (!value) return '';
+
+    return `${prefix}_${value}`;
+  }
+
+  // SteamID64
   if (/^765\d{14}$/.test(id)) {
     return `steam_${id}`;
   }
 
   return id;
+}
+
+function buildPalDefenderId(playerUid, steamIdRaw) {
+  const uid = String(playerUid || '').trim();
+  const raw = String(steamIdRaw || '').trim();
+  const lower = raw.toLowerCase();
+
+  // Steam player from ShowPlayers.
+  if (/^765\d{14}$/.test(raw)) {
+    return {
+      targetId: raw,
+      palDefenderUserId: `steam_${raw}`
+    };
+  }
+
+  // Already PalDefender formatted.
+  if (/^(steam|gdk)_/i.test(raw)) {
+    const pdid = normalizePalDefenderUserId(raw);
+    return {
+      targetId: pdid,
+      palDefenderUserId: pdid
+    };
+  }
+
+  // Console/Game Pass often appears as GDK or XBOX in ShowPlayers.
+  // PalDefender needs gdk_<full id>, not just GDK.
+  if (lower === 'gdk' || lower === 'xbox') {
+    const pdid = uid ? `gdk_${uid}` : '';
+
+    return {
+      targetId: pdid || uid,
+      palDefenderUserId: pdid
+    };
+  }
+
+  // If the UID itself is already formatted.
+  if (/^(steam|gdk)_/i.test(uid)) {
+    const pdid = normalizePalDefenderUserId(uid);
+
+    return {
+      targetId: pdid,
+      palDefenderUserId: pdid
+    };
+  }
+
+  // Fallback.
+  const fallback = normalizePalDefenderUserId(raw || uid);
+
+  return {
+    targetId: fallback,
+    palDefenderUserId: fallback
+  };
 }
 
 function getPalDefenderUserIdFromLink(link) {
@@ -301,7 +376,8 @@ function looksLikeRconError(response) {
     text.includes('error') ||
     text.includes('does not exist') ||
     text.includes('no player') ||
-    text.includes('player not')
+    text.includes('player not') ||
+    text.includes('failed to find player')
   );
 }
 
@@ -333,19 +409,18 @@ function parseShowPlayers(output) {
 
     const palName = parts[0];
     const playerUid = parts[1] || '';
-    const steamId = parts[2] || '';
+    const steamIdRaw = parts[2] || '';
 
-    const targetId = steamId || playerUid;
-    const palDefenderUserId = normalizePalDefenderUserId(targetId);
+    const ids = buildPalDefenderId(playerUid, steamIdRaw);
 
-    if (!palName || !targetId) continue;
+    if (!palName || !ids.targetId) continue;
 
     players.push({
       palName,
       playerUid,
-      steamId,
-      targetId,
-      palDefenderUserId
+      steamId: steamIdRaw,
+      targetId: ids.targetId,
+      palDefenderUserId: ids.palDefenderUserId
     });
   }
 
@@ -580,7 +655,7 @@ client.on('interactionCreate', async interaction => {
         content:
           `You are linked to **${link.pal_name}**.\n` +
           `PalDefender UserId: \`${palDefenderUserId || 'missing'}\`\n\n` +
-          `If /daily says player not found, staff may need to run /setpdid for your account.`,
+          `If this says missing, use /unlink and then /link again while you are online, or have staff use /setpdid.`,
         flags: EPHEMERAL
       });
     }
@@ -606,7 +681,7 @@ client.on('interactionCreate', async interaction => {
 
       if (!palDefenderUserId) {
         return interaction.editReply(
-          'Your link is missing a PalDefender UserId. Ask staff to use `/setpdid` for your account.'
+          'Your saved PalDefender UserId is missing or invalid. Use `/unlink`, then `/link` again while you are online. Staff can also fix it with `/setpdid`.'
         );
       }
 
@@ -631,7 +706,6 @@ client.on('interactionCreate', async interaction => {
         );
       }
 
-      // DatHost console / RCON does NOT need a slash here.
       const command = `giveitems ${palDefenderUserId} ${dailyItems}`;
 
       let response;
@@ -702,6 +776,14 @@ client.on('interactionCreate', async interaction => {
       const targetUser = interaction.options.getUser('discord_user');
       const inputId = interaction.options.getString('paldefender_userid');
       const palDefenderUserId = normalizePalDefenderUserId(inputId);
+
+      if (!palDefenderUserId) {
+        return interaction.reply({
+          content:
+            'That is not a valid PalDefender UserId. Use something like `steam_7656119...` or `gdk_253...`, not just `GDK`.',
+          flags: EPHEMERAL
+        });
+      }
 
       const link = await dbGet(
         `SELECT * FROM linked_users WHERE discord_id = ?`,
